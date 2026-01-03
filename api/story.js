@@ -1,23 +1,6 @@
 // api/story.js
 import { GoogleGenAI } from "@google/genai";
 
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function isRetryable(errMsg, status) {
-  const m = String(errMsg || "");
-  // 네트워크/일시 장애/레이트리밋 계열
-  return (
-    status === 429 ||
-    status === 408 ||
-    (status >= 500 && status <= 599) ||
-    /rate|quota|429|timeout|temporar|overload|unavailable/i.test(m)
-  );
-}
-
-
 /* ===============================
    CORS (GitHub Pages + localhost + origin:null 대응)
 ================================ */
@@ -36,6 +19,13 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
+}
+
+/* ===============================
+   Helpers
+================================ */
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function clamp(n, min, max) {
@@ -65,18 +55,26 @@ function extractJson(text) {
 function getResultText(result) {
   if (typeof result?.text === "string") return result.text;
 
-  // SDK에서 response.text() 형태로 오는 경우
   if (result?.response?.text && typeof result.response.text === "function") {
     try {
       return result.response.text();
     } catch {}
   }
 
-  // candidates 파싱(보험)
   const parts = result?.response?.candidates?.[0]?.content?.parts;
   if (Array.isArray(parts)) return parts.map((p) => p?.text || "").join("");
 
   return "";
+}
+
+function isRetryable(errMsg, status) {
+  const m = String(errMsg || "");
+  return (
+    status === 429 ||
+    status === 408 ||
+    (status >= 500 && status <= 599) ||
+    /rate|quota|429|timeout|temporar|overload|unavailable|econnreset|network|fetch failed/i.test(m)
+  );
 }
 
 /** 출력 형태 보정 (stats 범위 / choices 3개 / mood 값 등) */
@@ -221,6 +219,7 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Missing GEMINI_API_KEY" });
   }
 
+  // Vercel에서 body가 string으로 들어올 수도 있어서 방어
   let body = req.body;
   if (typeof body === "string") {
     try {
@@ -251,43 +250,66 @@ export default async function handler(req, res) {
 ${JSON.stringify(summary)}
 `;
 
-  try {
-    const result = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: userPrompt,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: "application/json",
-        temperature: 0.9,
-        topP: 0.9,
-        maxOutputTokens: 900,
-      },
-    });
+  // ✅ 중간중간 오류(429/5xx/JSON깨짐) 줄이기: 서버 재시도 + 파싱 실패 시 재생성
+  let lastErr = null;
 
-    const raw = getResultText(result);
-    const parsed = (() => {
-      try {
-        return JSON.parse(raw);
-      } catch {
-        return extractJson(raw);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const result = await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: userPrompt,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          responseMimeType: "application/json",
+          temperature: 0.85,     // 너무 높으면 JSON 깨짐이 늘어남
+          topP: 0.9,
+          maxOutputTokens: 750,  // 너무 길면 깨질 확률↑
+        },
+      });
+
+      const raw = getResultText(result);
+
+      const parsed = (() => {
+        try {
+          return JSON.parse(raw);
+        } catch {
+          return extractJson(raw);
+        }
+      })();
+
+      // JSON이 깨졌으면 재생성으로 간주하고 재시도
+      if (!parsed) {
+        lastErr = new Error("Bad model output (json parse failed)");
+        await sleep(250 * (attempt + 1));
+        continue;
       }
-    })();
 
-    if (!parsed) {
-      return res.status(502).json({
-        error: "Bad model output",
-        raw: String(raw).slice(0, 800),
+      const normalized = normalizePayload(parsed, state);
+      return res.status(200).json(normalized);
+    } catch (err) {
+      lastErr = err;
+
+      const msg = String(err?.message || err);
+      const status = Number(err?.status || err?.code || 0);
+
+      if (isRetryable(msg, status) && attempt < 2) {
+        // 지수 백오프: 0.4s → 0.9s
+        await sleep(400 + attempt * 500);
+        continue;
+      }
+
+      return res.status(500).json({
+        error: "Story generation failed",
+        detail: msg,
+        hint: isRetryable(msg, status)
+          ? "Temporary issue. Try again."
+          : "Non-retryable error (check API key / request size).",
       });
     }
-
-    const normalized = normalizePayload(parsed, state);
-    return res.status(200).json(normalized);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({
-      error: "Story generation failed",
-      detail: String(err?.message || err),
-    });
   }
-}
 
+  return res.status(502).json({
+    error: "Story generation failed after retries",
+    detail: String(lastErr?.message || lastErr || "unknown"),
+  });
+}
