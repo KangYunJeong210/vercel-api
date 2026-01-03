@@ -1,0 +1,8 @@
+{
+    "name": "verblack-story-api",
+    "private": true,
+    "type": "module",
+    "dependencies": {
+        "@google/genai": "^0.8.0"
+    }
+}
