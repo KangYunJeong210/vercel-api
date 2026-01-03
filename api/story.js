@@ -1,6 +1,23 @@
 // api/story.js
 import { GoogleGenAI } from "@google/genai";
 
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryable(errMsg, status) {
+  const m = String(errMsg || "");
+  // 네트워크/일시 장애/레이트리밋 계열
+  return (
+    status === 429 ||
+    status === 408 ||
+    (status >= 500 && status <= 599) ||
+    /rate|quota|429|timeout|temporar|overload|unavailable/i.test(m)
+  );
+}
+
+
 /* ===============================
    CORS (GitHub Pages + localhost + origin:null 대응)
 ================================ */
@@ -273,3 +290,4 @@ ${JSON.stringify(summary)}
     });
   }
 }
+
