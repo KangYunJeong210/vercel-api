@@ -1,7 +1,7 @@
 {
-    "functions": {
-        "api/story.js": {
-            "runtime": "nodejs20.x"
-        }
+  "functions": {
+    "api/story.js": {
+      "runtime": "nodejs@20"
     }
+  }
 }
